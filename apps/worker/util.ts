@@ -8,6 +8,7 @@ import { rejects } from 'node:assert';
 import { pg } from "db";
 import type { chunkType, filesType } from './types';
 import { appendFile } from 'node:fs/promises';
+import { ollamaClient, EMBEDDING_MODEL } from './ollama-client';
 
 export async function gitclone(url: string, repositoryId: string): Promise<void> {
   const targetPath = path.join(process.cwd(), "temp", repositoryId);
@@ -59,6 +60,10 @@ export async function listAllFiles(repoName: string, repositoryId: string) {
 async function walk(dir: string, files: filesType) {
   const IGNORE_DIRS = ["node_modules", "dist", "build", ".git", ".next", "coverage", ".turbo"];
 
+  // lock files are huge, machine-generated, and useless for RAG — skip by name
+  // even though their extension (.json/.yaml) is allowed.
+  const IGNORE_FILES = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb"];
+
   const ALLOWED_EXTENSIONS = [
     ".ts",
     ".tsx",
@@ -85,7 +90,7 @@ async function walk(dir: string, files: filesType) {
       continue;
     }
 
-    if (entry.isFile() && ALLOWED_EXTENSIONS.includes(path.extname(entry.name))) {
+    if (entry.isFile() && ALLOWED_EXTENSIONS.includes(path.extname(entry.name)) && !IGNORE_FILES.includes(entry.name)) {
       try {
         const content = await fsp.readFile(fullPath, { encoding: "utf8" })
         files.push({ fileName: fullPath, content });
@@ -101,20 +106,59 @@ async function walk(dir: string, files: filesType) {
 export async function storeFileAndChunks(files: filesType, repositoryId: string) {
 
   for (const file of files) {
+    const chunks = createFileChunks(file.content);
+
+    // a file may produce no chunks (e.g. empty content) — still store the file, just skip embedding
+    if (chunks.length === 0) {
+      await pg.file.create({ data: { content: file.content, path: file.fileName, repoId: repositoryId } });
+      continue;
+    }
+
+    // generate embeddings BEFORE opening the transaction, so the network call
+    // to ollama doesn't hold the db transaction open the whole time
+    const embeddings = await embedChunks(chunks); // number[][]
+
     await pg.$transaction(async tx => {
       const fileRow = await tx.file.create({ data: { content: file.content, path: file.fileName, repoId: repositoryId } });
-      const chunks = createFileChunks(fileRow.content);
-      await tx.chunk.createMany({
-        data: chunks.map(chunk => ({
-          fileId: fileRow.id,
-          content: chunk,
-          startLine: 0, // todo : do this later , "citation" depends on this , and also learn about this "citation"
-          endLine: 0
-        }))
-      })
+
+      for (let i = 0; i < chunks.length; i++) {
+        // create the chunk row first so prisma generates the uuid + sets the fk
+        const chunkRow = await tx.chunk.create({
+          data: {
+            fileId: fileRow.id,
+            content: chunks[i]!,
+            startLine: 0, // todo : do this later , "citation" depends on this , and also learn about this "citation"
+            endLine: 0
+          }
+        });
+
+        // prisma can't write the Unsupported("vector(768)") column, so set it with raw sql.
+        // pgvector accepts the textual form '[a,b,c]' cast to ::vector
+        const vectorLiteral = `[${embeddings[i]!.join(",")}]`;
+        await tx.$executeRaw`UPDATE "Chunk" SET embedding = ${vectorLiteral}::vector WHERE id = ${chunkRow.id}`;
+      }
     })
   }
 }
+
+// calls ollama's openai-compatible embeddings endpoint once for all chunks of a file.
+// returns one number[] per chunk, in the same order as the input.
+async function embedChunks(chunks: string[]): Promise<number[][]> {
+  const res = await ollamaClient.embeddings.create({
+    model: EMBEDDING_MODEL,
+    input: chunks,
+  });
+  console.log("res from embedding---->",res);
+  
+  // sort by index defensively — the api returns an `index` per item that maps back to the input order
+  return res.data
+    .sort((a, b) => a.index - b.index)
+    .map(item => item.embedding as number[]);
+}
+
+// const ans = await embedChunks(["the first chunk","the second chunk"]);
+// console.log("ans------->",ans);
+
 
 export async function storeRepository(url: string, repositoryId: string, repoName: string) {
   try {
@@ -133,9 +177,35 @@ export async function storeRepository(url: string, repositoryId: string, repoNam
   }
 }
 
-function createFileChunks(content: string) {
-  const chunks = content.split(/(?=export\s+function|function\s+|class\s+)/g).filter(Boolean)
-  return chunks;
+// nomic-embed-text's context window (ollama default num_ctx) is 2048 tokens.
+// ~4 chars/token, so cap a chunk well under that to leave headroom: ~1500 tokens.
+const MAX_CHARS = 6000;
+// overlap so context isn't lost at a hard cut — the tail of one window
+// is repeated at the head of the next.
+const CHUNK_OVERLAP = 600;
+
+function createFileChunks(content: string): string[] {
+  // first split semantically on function/class boundaries
+  const semanticChunks = content.split(/(?=export\s+function|function\s+|class\s+)/g).filter(Boolean)
+
+  // then enforce the size cap, sliding a window (with overlap) over any chunk
+  // that's still too large — e.g. whole markdown/json files that have no
+  // function/class keyword and so came through as one giant chunk.
+  const sized: string[] = [];
+  for (const chunk of semanticChunks) {
+    if (chunk.length <= MAX_CHARS) {
+      sized.push(chunk);
+      continue;
+    }
+    const step = MAX_CHARS - CHUNK_OVERLAP;
+    for (let start = 0; start < chunk.length; start += step) {
+      sized.push(chunk.slice(start, start + MAX_CHARS));
+      // last window already reached the end — stop so we don't emit a
+      // tiny trailing slice that's just the overlap tail
+      if (start + MAX_CHARS >= chunk.length) break;
+    }
+  }
+  return sized;
 }
 
 // export function createChunks(files: filesType) {

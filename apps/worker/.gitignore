@@ -1,6 +1,9 @@
 # dependencies (bun install)
 node_modules
 
+# temporary cloned repos
+temp/
+
 # output
 out
 dist
